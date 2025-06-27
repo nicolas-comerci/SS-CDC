@@ -11,7 +11,6 @@ int main(int argc, char *argv[]){
 	if ( parse_args(argc, argv) != 0)
 		return 0;
 
-	init_fp_pool(1*1024*1024, SHA_DIGEST_LENGTH);
 	if (dir){
 		collect_files(dir);
 		strcpy(fname_ab, dir);
@@ -33,7 +32,6 @@ int main(int argc, char *argv[]){
 			}
 	}
 
-	deinit_fp_pool();
 	sprintf(hname, "hash %s", hash_name);
 	print_stats(hname);
 	return 0;

@@ -19,6 +19,9 @@
 #include <openssl/sha.h>
 #include <dirent.h>
 
+#include <string>
+#include <unordered_set>
+
 #define HASHLEN 256
 
 #define USE_MEMALLOC 1
@@ -139,22 +142,35 @@ struct file_struct{
 
 static void *map_file(struct file_struct *fs){
 	fs->fd = open(fs->fname, O_LARGEFILE|O_NOATIME);
-	if (fs->fd < 0) return NULL;
+	if (fs->fd < 0) {
+		printf("Bad file descriptor?!\n");
+		return NULL;
+	}
 	fs->length = lseek(fs->fd, 0, SEEK_END);
 	if (fs->test_length == 0 || fs->test_length > fs->length)
 		fs->test_length = fs->length;
+	printf("length: %llu test_length %llu\n", fs->length, fs->test_length);
 	//printf("length: OX%lx test_length OX%lx\n", fs->length, fs->test_length);
 	void *tmp	= mmap(NULL, fs->length+HASHLEN, PROT_READ, MAP_PRIVATE, fs->fd, 0);
-	if (tmp == MAP_FAILED)
+	if (tmp == MAP_FAILED) {
+		printf("Map Failed!\n");
 		return NULL;
+	}
+	printf("Map success!\n");
+		
 #if USE_MEMALLOC
+	printf("Copying nmap to memalloc\n");
 	int len = posix_memalign(reinterpret_cast<void**>(&fs->map), 64, (fs->length+63)/64*64+HASHLEN);
 	if(len != 0){
 		printf("Len: %d\n", len);
 	}
+	printf("Memory allocated, copying\n");
 	memcpy(fs->map, tmp, fs->length);
+	printf("Copied, zeroing memory\n");
 	bzero((uint8_t*)fs->map+fs->length, HASHLEN);
+	printf("Unmapping\n");
 	munmap(tmp, fs->length+HASHLEN);
+	printf("Done\n");
 #else
 	fs->map = tmp;
 #endif
@@ -163,7 +179,7 @@ static void *map_file(struct file_struct *fs){
 }
 
 static void unmap_file(struct file_struct *fs){
-	if(fs->map > 0){
+	if(fs->map != nullptr){
 #if USE_MEMALLOC
 		free(fs->map);
 #else
@@ -187,6 +203,15 @@ int chunking_phase_one_serial_crc(struct file_struct *fs);
 int chunking_phase_one_parallel_crcv0(struct file_struct *fs);
 int chunking_phase_one_parallel_crcv1(struct file_struct *fs);
 
+static void print_valid_hash_funcs() {
+	printf("Only Valid hash function as below accepted: ");
+	printf(" gear:s ; ");
+	printf("gear:p ; ");
+	printf("crc:s ; ");
+	printf("crc:p0 ; ");
+	printf("crc:p1 \n");
+}
+
 static int set_chunk_func(char *name){
 	if (strcmp(name, "gear:s") == 0){
 		chunk_f = chunking_phase_one_serial_gear;
@@ -201,12 +226,7 @@ static int set_chunk_func(char *name){
 	else if (strcmp(name, "crc:p1") == 0)
 		chunk_f = chunking_phase_one_parallel_crcv1;
 	else{
-		printf("Only Valid hash function as below accepted:\n");
-		printf(" gear:s ; ");
-		printf("gear:p ; ");
-		printf("crc:s ; ");
-		printf("crc:p0 ; ");
-		printf("crc:p1 \n");
+		print_valid_hash_funcs();
 		return 1;
 	}
 	return 0;
@@ -216,12 +236,7 @@ static int set_chunk_func(char *name){
 static inline void help(){
 	printf("help: -f fname -m min -M max_chunksize_KB"
 			"-ss segment_MB -ts test_size -nm magic_number -d dir -bmb num -H hash -cc -skip\n");
-	printf("Only Valid hash function as below accepted: ");
-		printf(" gear:s ; ");
-		printf("gear:p ; ");
-		printf("crc:s ; ");
-		printf("crc:p0 ; ");
-		printf("crc:p1 \n");
+	print_valid_hash_funcs();
 }
 
 int parse_args(int argc, char *argv[]){
@@ -515,106 +530,15 @@ static int next_chunk(struct file_struct *fs, struct chunk_boundary *cb){
 }
 
 
-static inline int compute_fingerprint(struct file_struct *fs, struct chunk_boundary *cb, uint8_t *hash){
+static inline void compute_fingerprint(struct file_struct *fs, struct chunk_boundary *cb, uint8_t *hash){
 	SHA1((uint8_t*)fs->map+cb->left, cb->right-cb->left, hash);
-	return 0;
 }
 
-static inline void print_fingperint(uint8_t *hash, int len){
+static inline void print_fingerprint(uint8_t *hash, int len){
 	for(int i=0; i<len; i++){
 		printf("%x", hash[i]);
 	}
 	printf("\n");
-}
-
-//return 1 if match; else return 0
-static inline int compare_fingerprint(uint8_t *hash1, uint8_t *hash2, int len){
-	if (len %8 == 0){
-			for(int i=0; i< len; i+=8){
-				if (*(uint64_t*)(hash1+i) !=  *(uint64_t*)(hash2+i))
-					return 0;
-			}
-			return 1;
-	} else{
-			for(int i=0; i< len; i+=4){
-				if (*(uint32_t*)(hash1+i) !=  *(uint32_t*)(hash2+i))
-					return 0;
-			}
-			return 1;
-	}
-}
-
-
-struct fp_entry_st{
-	uint8_t hash[SHA_DIGEST_LENGTH];
-	struct fp_entry_st *next;
-};
-
-struct fp_pool{
-	int num_slots;
-	int fp_len;
-	struct fp_entry_st* slots[];
-};
-
-
-static struct fp_pool *hash_pool = NULL;
-static void init_fp_pool(int slot_cnt, int fp_len){
-	hash_pool = (struct fp_pool*)calloc(sizeof(struct fp_pool)+slot_cnt*sizeof(void*), 1);
-	assert(hash_pool);
-	hash_pool->num_slots = slot_cnt;
-	hash_pool->fp_len = fp_len;
-}
-
-static inline struct fp_entry_st *new_fp_entry(uint8_t *hash, int len){
-	struct fp_entry_st *p = (struct fp_entry_st*) calloc(1, sizeof(struct fp_entry_st));
-	assert(p);
-	memcpy(p->hash, hash, len);
-	return p;
-}
-
-static inline void free_fp_entry(struct fp_entry_st *entry){
-	if(entry)
-		free(entry);
-}
-
-static void deinit_fp_pool(){
-	if(hash_pool){
-		struct fp_entry_st *item;
-		for(int i=0; i<hash_pool->num_slots; i++){
-			item = hash_pool->slots[i];
-			while(item){
-				hash_pool->slots[i] = item->next;
-				free_fp_entry(item);
-				item = hash_pool->slots[i];
-			}
-		}
-	}
-}
-
-static inline uint32_t table_index(uint8_t *hash){
-	uint32_t idx = *(uint32_t*)hash;
-	if(hash_pool == NULL)
-		return -1;
-	return idx%hash_pool->num_slots;
-}
-
-static int insert_fp(uint8_t *hash){
-	uint32_t idx = table_index(hash);
-	struct fp_entry_st *item = new_fp_entry(hash, hash_pool->fp_len);
-	item->next = hash_pool->slots[idx];
-	hash_pool->slots[idx] = item;
-	return 0;
-}
-
-static int lookup_fp(uint8_t *hash){
-	uint32_t idx = table_index(hash);
-	struct fp_entry_st *item = hash_pool->slots[idx];
-	while(item){
-		if(compare_fingerprint(hash, item->hash, hash_pool->fp_len))
-			return 1;
-		item = item->next;
-	}
-	return 0;
 }
 
 
@@ -664,6 +588,7 @@ static void print_stats(char *opt){
 }
 
 static int chunking_phase_two(struct file_struct *fs){
+	std::unordered_set<std::string> known_fingerprints{};
 	struct chunk_boundary cb;
 	uint8_t hash[SHA_DIGEST_LENGTH];
 	int i = 0;
@@ -689,9 +614,10 @@ static int chunking_phase_two(struct file_struct *fs){
 		compute_fingerprint(fs, &cb, hash);
 		dedup_stats.dedup_ns += time_nsec() - s_time;
 		dedup_stats.total_chunks++;
-		dedup_stats.total_size += cb.right-cb.left;
-		if(lookup_fp(hash) == 0){
-			insert_fp(hash);
+		dedup_stats.total_size += cb.right - cb.left;
+		const auto hash_str = std::string(reinterpret_cast<char*>(&hash), SHA_DIGEST_LENGTH);
+		if(known_fingerprints.find(hash_str) == known_fingerprints.end()){
+			known_fingerprints.insert(hash_str);
 			uniq_chunks++;
 			dedup_stats.uniq_size+= cb.right-cb.left;
 			dedup_stats.uniq_chunks ++;
@@ -700,18 +626,13 @@ static int chunking_phase_two(struct file_struct *fs){
 	return 0;
 }
 
-static int deduplicate(struct file_struct *fs){
-	uint8_t hash[SHA_DIGEST_LENGTH];
-	struct chunk_boundary cb;
-		//compute_fingerprint(fs, &cb, hash);
-	return 0;
-}
-
 static int init_fs(struct file_struct *fs){
+	printf("map_file starting\n");
 	if (map_file(fs) == NULL){
 		printf("Error: map file %s failed\n", fs->fname);
 		return 1;
 	}
+	printf("map_file seems successful\n");
 
 	assert( 0 == posix_memalign(reinterpret_cast<void**>(&fs->breakpoint_bm), 64, (fs->length+7)/8+HASHLEN/8));
 	bzero(fs->breakpoint_bm, (fs->length+7)/8 + HASHLEN/8);
@@ -786,6 +707,7 @@ static void clear_files(){
 #include "chunker-gear.h"
 
 static void run_chunking_with_timer(){
+	printf("Started run_chunking_with_timer\n");
 	uint64_t start, end;
 	uint64_t start_s, end_s;
 	uint64_t start_ticks, end_ticks;
@@ -828,6 +750,7 @@ static void run_chunking_with_timer(){
 			chunk_f(&fs);
 			end = time_nsec();
 			dedup_stats.serial_ns += end - start;
+			printf("Finished serial hashing! Onto phase 2\n");
 	}
 	chunking_phase_two(&fs);
 }
