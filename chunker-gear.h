@@ -90,6 +90,7 @@ int chunking_phase_one_parallel_gear(struct file_struct *fs){
 	bytes_per_thread = (n_bytes_left/16)/32*32;
 	bytes_last_thread = n_bytes_left - bytes_per_thread*15;
 	//printf("Parallel: %u bytes %u bytes\n", bytes_per_thread, bytes_last_thread);
+	vindex = _mm512_mullo_epi32(vindex, _mm512_set1_epi32(bytes_per_thread));
 
 	int i=0;
 	int j=0;
@@ -116,7 +117,7 @@ int chunking_phase_one_parallel_gear(struct file_struct *fs){
 
 		//printf("LOOP: i %u j %u i32 %u\n", i,j, i%32);
 		while(i<offset+cur_segsize+(GEAR_HASHLEN()+7)/8*8){
-			__m512i cbytes = _mm512_i32gather_epi32(vindex*bytes_per_thread, (void*)(((uint8_t*)fs->map)+i), 1);
+			__m512i cbytes = _mm512_i32gather_epi32(vindex, (void*)(((uint8_t*)fs->map)+i), 1);
 
 			for (j=0; j<sizeof(int); j++) {
 				doGear(hash, cbytes);
@@ -137,9 +138,9 @@ int chunking_phase_one_parallel_gear(struct file_struct *fs){
 			}
 
 			if (((i&31)== 28 || i+4 >= offset+cur_segsize+GEAR_HASHLEN()) && _mm512_cmpneq_epi32_mask(mm_bm,_mm512_set1_epi32(0)) > 0){
-				bm = _mm512_i32gather_epi32(vindex*bytes_per_thread>>3, (void*)(fs->breakpoint_bm+((i>>5)<<2)), 1);
+				bm = _mm512_i32gather_epi32(_mm512_srli_epi32(vindex, 3), (void*)(fs->breakpoint_bm+((i>>5)<<2)), 1);
 				bm = _mm512_or_epi32(mm_bm, bm);
-				_mm512_i32scatter_epi32((void*)(fs->breakpoint_bm+((i>>5)<<2)), vindex*bytes_per_thread>>3, bm, 1);
+				_mm512_i32scatter_epi32((void*)(fs->breakpoint_bm+((i>>5)<<2)), _mm512_srli_epi32(vindex, 3), bm, 1);
 				mm_bm = _mm512_set1_epi32(0);
 			}
 			i += 4;

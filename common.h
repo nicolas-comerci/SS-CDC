@@ -5,10 +5,13 @@
 #include "cycle.h"
 #include <cstdio>
 #include <cstdint>
-#ifndef __WIN32__
+#ifndef _WIN32
 #include <fcntl.h>
 #include <sys/mman.h>
 #else
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 #include <cstring>
@@ -60,11 +63,15 @@ struct chunk_boundary{
 	uint64_t right;
 };
 
+#ifndef _MSC_VER
 #define vector_idx(table,idx) \
 	((__v16si)table)[idx]
+#else
+#define vector_idx(table,idx) \
+	table.m512i_i32[idx]
+#endif
 
-#define _A16 __attribute__((__aligned__(16)))
-static const uint32_t _A16 crct[256] =
+ alignas(16) static const uint32_t crct[256] =
 {
 	0x00000000,0x77073096,0xEE0E612C,0x990951BA,0x076DC419,0x706AF48F,0xE963A535,0x9E6495A3,
 	0x0EDB8832,0x79DCB8A4,0xE0D5E91E,0x97D2D988,0x09B64C2B,0x7EB17CBD,0xE7B82D07,0x90BF1D91,
@@ -173,7 +180,7 @@ inline void portable_aligned_free(void* ptr) {
 
 
 static void *map_file(struct file_struct *fs){
-#ifndef __WIN32__
+#ifndef _WIN32
 	fs->fd = fdopen(open(fs->fname, O_LARGEFILE|O_NOATIME), "rb");
 #else
 	fs->fd = std::fopen(fs->fname, "rb");
@@ -182,7 +189,7 @@ static void *map_file(struct file_struct *fs){
 		printf("Bad file descriptor?!\n");
 		return NULL;
 	}
-#ifndef __WIN32__
+#ifndef _WIN32
 	std::fseek(fs->fd, 0, SEEK_END);
 	fs->length = std::ftell(fs->fd);
 #else
@@ -194,7 +201,7 @@ static void *map_file(struct file_struct *fs){
 		fs->test_length = fs->length;
 	printf("length: %llu test_length %llu\n", fs->length, fs->test_length);
 		
-#if USE_MEMALLOC || __WIN32__
+#if USE_MEMALLOC || _WIN32
 	printf("Allocating memory for file\n");
 	fs->map = portable_aligned_alloc(64, (fs->length+63)/64*64+HASHLEN);
 	if(fs->map == nullptr){
@@ -205,7 +212,7 @@ static void *map_file(struct file_struct *fs){
 	std::fseek(fs->fd, 0, SEEK_SET);
 	uint64_t read_size = 0;
 	while (read_size < fs->length) {
-		const auto to_read_size = std::min<uint64_t>(fs->length - read_size, std::numeric_limits<size_t>::max());
+		const uint64_t to_read_size = std::min<uint64_t>(fs->length - read_size, std::numeric_limits<size_t>::max());
 		const auto actually_read = std::fread(static_cast<uint8_t*>(fs->map) + read_size, 1, to_read_size, fs->fd);
 		if (to_read_size != actually_read) {
 			printf("Reading file failed\n");

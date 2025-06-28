@@ -89,22 +89,23 @@ int chunking_phase_one_serial_crc(struct file_struct *fs){
 }
 
 
-	int chunking_phase_one_parallel_crcv1(struct file_struct *fs){
-		__m512i vindex = _mm512_setr_epi32(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
-		__m512i mm_break_mark = _mm512_set1_epi32(break_mask);
-		__m512i cmask = _mm512_set1_epi32(0xff);
-		__m512i mm_zero = _mm512_set1_epi32(0);
-		uint64_t n_bytes_left;
-		uint64_t offset = 0;
-		uint32_t cur_segsize, last_segsize;
+int chunking_phase_one_parallel_crcv1(struct file_struct *fs){
+	__m512i vindex = _mm512_setr_epi32(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
+	__m512i mm_break_mark = _mm512_set1_epi32(break_mask);
+	__m512i cmask = _mm512_set1_epi32(0xff);
+	__m512i mm_zero = _mm512_set1_epi32(0);
+	uint64_t n_bytes_left;
+	uint64_t offset = 0;
+	uint32_t cur_segsize, last_segsize;
 
-		n_bytes_left = fs->test_length;
+	n_bytes_left = fs->test_length;
 	//printf("%x to test\n", n_bytes_left);
 	
 	uint32_t bytes_per_thread, bytes_last_thread;
 	bytes_per_thread = (n_bytes_left/16)/32*32;
 	bytes_last_thread = n_bytes_left - bytes_per_thread*15;
 	//printf("Parallel: %u bytes %u bytes\n", bytes_per_thread, bytes_last_thread);
+	vindex = _mm512_mullo_epi32(vindex, _mm512_set1_epi32(bytes_per_thread));
 	
 	
 	int i=0;
@@ -128,8 +129,7 @@ int chunking_phase_one_serial_crc(struct file_struct *fs){
 		//printf("Processing data stream at [0X%x-0X%x-1]: 0x%x bytes/thread parallel\n", offset, offset+cur_segsize*n_threads, cur_segsize);
 		// For the first HASHLEN bytes, calculate hash value
 		for (; i<HASHLEN; i+=4){
-			__m512i cbytes = _mm512_i32gather_epi32(vindex*bytes_per_thread, (void*)((uint8_t*)fs->map+offset+i), 1);
-			//__m512i cbytes = _mm512_i32gather_epi32(vindex*cur_segsize, (void*)((uint8_t*)fs->map+offset+i), 1);
+			__m512i cbytes = _mm512_i32gather_epi32(vindex, (void*)((uint8_t*)fs->map+offset+i), 1);
 			//doCrc: x = (x >> 8) ^ crct[(x ^ c) & 0xff];
 			for (int j=0; j<sizeof(int); j++){
 				doCrc(hash, cbytes);
@@ -141,8 +141,8 @@ int chunking_phase_one_serial_crc(struct file_struct *fs){
 		__m512i bm;
 		i = HASHLEN;
 		for(; i<cur_segsize+HASHLEN; i+=4){
-			__m512i left_cbytes = _mm512_i32gather_epi32(vindex*bytes_per_thread, (void*)((uint8_t*)fs->map+offset+i-HASHLEN), 1);
-			__m512i cbytes = _mm512_i32gather_epi32(vindex*bytes_per_thread, (void*)(((uint8_t*)fs->map)+offset+i), 1);
+			__m512i left_cbytes = _mm512_i32gather_epi32(vindex, (void*)((uint8_t*)fs->map+offset+i-HASHLEN), 1);
+			__m512i cbytes = _mm512_i32gather_epi32(vindex, (void*)(((uint8_t*)fs->map)+offset+i), 1);
 			__m512i idx2 = _mm512_and_epi32(left_cbytes, cmask);
 			//__m512i mm_bm = _mm512_set1_epi32(0);
 			if (i%32 == 0){
@@ -177,9 +177,9 @@ int chunking_phase_one_serial_crc(struct file_struct *fs){
 			}
 
 			if ((i&31)== 28 && _mm512_cmpneq_epi32_mask(mm_bm,_mm512_set1_epi32(0)) > 0){
-				bm = _mm512_i32gather_epi32(vindex*bytes_per_thread>>3, (void*)(fs->breakpoint_bm+(offset>>3)+((i>>5)<<2)), 1);
+				bm = _mm512_i32gather_epi32(_mm512_srli_epi32(vindex, 3), (void*)(fs->breakpoint_bm+(offset>>3)+((i>>5)<<2)), 1);
 				bm = _mm512_or_epi32(mm_bm, bm);
-				_mm512_i32scatter_epi32((void*)(fs->breakpoint_bm+(offset>>3)+((i>>5)<<2)), vindex*bytes_per_thread>>3, bm, 1);
+				_mm512_i32scatter_epi32((void*)(fs->breakpoint_bm+(offset>>3)+((i>>5)<<2)), _mm512_srli_epi32(vindex, 3), bm, 1);
 			}
 		}
 
