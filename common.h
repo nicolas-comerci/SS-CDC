@@ -1,24 +1,24 @@
 #ifndef COMMON_H_H
 #define COMMON_H_H
 
-#define _XOPEN_SOURCE 500
+#include <algorithm>
 #include "cycle.h"
 #include <cstdio>
-#include <sys/types.h>
-#include <sys/uio.h>
-#include <unistd.h>
 #include <cstdint>
-#include <sys/stat.h>
+#ifndef __WIN32__
 #include <fcntl.h>
 #include <sys/mman.h>
-#include <cstdlib>
+#else
+#include <windows.h>
+#endif
 #include <cstring>
 #include <immintrin.h>
 #include <cassert>
 #include <ctime>
-#include <dirent.h>
-
+#include <filesystem>
+#include <iostream>
 #include <unordered_set>
+#include <vector>
 
 #include "xxhash.h"
 
@@ -26,13 +26,21 @@
 
 #define USE_MEMALLOC 1
 
-static	inline uint64_t
-time_nsec(void)
-{
+#ifdef _WIN32
+static inline uint64_t time_nsec(void) {
+	static LARGE_INTEGER freq;
+	static BOOL initialized = QueryPerformanceFrequency(&freq);
+	LARGE_INTEGER counter;
+	QueryPerformanceCounter(&counter);
+	return counter.QuadPart * 1000000000ULL / freq.QuadPart;
+}
+#else
+static inline uint64_t time_nsec(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
   return ts.tv_sec * UINT64_C(1000000000) + ts.tv_nsec;
 }
+#endif
 
 static uint32_t min_chunksize = 2*1024;
 static uint32_t max_chunksize = 64*1024;
@@ -132,46 +140,89 @@ static const uint32_t crcu[256] =
 struct file_struct{
 	char *fname;
 	uint64_t length, test_length;
-	int fd;
+	std::FILE* fd;
 	void *map;
 	uint8_t *breakpoint_bm;
 	uint8_t *breakpoint_bm_base; // for serial chunking method as the base
 	uint64_t next_start;  // next chunk start, used by next_chunk()
 };
 
+inline void* portable_aligned_alloc(std::size_t alignment, std::size_t size) {
+#ifdef _WIN32
+	return _aligned_malloc(size, alignment);
+#elif defined(__APPLE__) || defined(__MACH__)
+	// macOS: posix_memalign is safest
+	void* ptr = nullptr;
+	if (posix_memalign(&ptr, alignment, size) != 0) {
+		return nullptr;
+	}
+	return ptr;
+#else
+	// Linux and others with C11 support
+	return std::aligned_alloc(alignment, size);
+#endif
+}
+
+inline void portable_aligned_free(void* ptr) {
+#ifdef _WIN32
+	_aligned_free(ptr);
+#else
+	std::free(ptr);
+#endif
+}
+
 
 static void *map_file(struct file_struct *fs){
-	fs->fd = open(fs->fname, O_LARGEFILE|O_NOATIME);
-	if (fs->fd < 0) {
+#ifndef __WIN32__
+	fs->fd = fdopen(open(fs->fname, O_LARGEFILE|O_NOATIME), "rb");
+#else
+	fs->fd = std::fopen(fs->fname, "rb");
+#endif
+	if (fs->fd == nullptr) {
 		printf("Bad file descriptor?!\n");
 		return NULL;
 	}
-	fs->length = lseek(fs->fd, 0, SEEK_END);
+#ifndef __WIN32__
+	std::fseek(fs->fd, 0, SEEK_END);
+	fs->length = std::ftell(fs->fd);
+#else
+	_fseeki64(fs->fd, 0, SEEK_END);
+	fs->length = _ftelli64(fs->fd);
+#endif
+
 	if (fs->test_length == 0 || fs->test_length > fs->length)
 		fs->test_length = fs->length;
 	printf("length: %llu test_length %llu\n", fs->length, fs->test_length);
-	//printf("length: OX%lx test_length OX%lx\n", fs->length, fs->test_length);
-	void *tmp	= mmap(NULL, fs->length+HASHLEN, PROT_READ, MAP_PRIVATE, fs->fd, 0);
+		
+#if USE_MEMALLOC || __WIN32__
+	printf("Allocating memory for file\n");
+	fs->map = portable_aligned_alloc(64, (fs->length+63)/64*64+HASHLEN);
+	if(fs->map == nullptr){
+		printf("Bad alloc?!\n");
+		return NULL;
+	}
+	printf("Memory allocated, reading file\n");
+	std::fseek(fs->fd, 0, SEEK_SET);
+	uint64_t read_size = 0;
+	while (read_size < fs->length) {
+		const auto to_read_size = std::min<uint64_t>(fs->length - read_size, std::numeric_limits<size_t>::max());
+		const auto actually_read = std::fread(static_cast<uint8_t*>(fs->map) + read_size, 1, to_read_size, fs->fd);
+		if (to_read_size != actually_read) {
+			printf("Reading file failed\n");
+			return nullptr;
+		}
+		read_size += to_read_size;
+	}
+	printf("Read, zeroing memory\n");
+	std::memset(static_cast<uint8_t *>(fs->map) + fs->length, 0, HASHLEN);
+	printf("Done\n");
+#else
+	void *tmp = mmap(NULL, fs->length + HASHLEN, PROT_READ, MAP_PRIVATE, fileno(fs->fd), 0);
 	if (tmp == MAP_FAILED) {
 		printf("Map Failed!\n");
 		return NULL;
 	}
 	printf("Map success!\n");
-		
-#if USE_MEMALLOC
-	printf("Copying nmap to memalloc\n");
-	int len = posix_memalign(reinterpret_cast<void**>(&fs->map), 64, (fs->length+63)/64*64+HASHLEN);
-	if(len != 0){
-		printf("Len: %d\n", len);
-	}
-	printf("Memory allocated, copying\n");
-	memcpy(fs->map, tmp, fs->length);
-	printf("Copied, zeroing memory\n");
-	bzero((uint8_t*)fs->map+fs->length, HASHLEN);
-	printf("Unmapping\n");
-	munmap(tmp, fs->length+HASHLEN);
-	printf("Done\n");
-#else
 	fs->map = tmp;
 #endif
 
@@ -181,21 +232,21 @@ static void *map_file(struct file_struct *fs){
 static void unmap_file(struct file_struct *fs){
 	if(fs->map != nullptr){
 #if USE_MEMALLOC
-		free(fs->map);
+		portable_aligned_free(fs->map);
 #else
 		munmap(fs->map, fs->length+HASHLEN);
 #endif
 	}
-	if (fs->fd > 0)
-		close(fs->fd);
+	if (fs->fd != nullptr)
+		std::fclose(fs->fd);
 }
 
-static struct file_struct fs = {NULL, 0, 0, -1, NULL, NULL, 0};
+static struct file_struct fs = {NULL, 0, 0, nullptr, NULL, NULL, 0};
 static char *dir = NULL;
 typedef int (*phase_one_func)(struct file_struct *fs);
 static phase_one_func chunk_f = NULL;
 static int num_files_test = 0;
-static char *hash_name = NULL;
+static std::string hash_name{};
 
 int chunking_phase_one_serial_gear(struct file_struct *fs);
 int chunking_phase_one_parallel_gear(struct file_struct *fs);
@@ -212,18 +263,20 @@ static void print_valid_hash_funcs() {
 	printf("crc:p1 \n");
 }
 
-static int set_chunk_func(char *name){
-	if (strcmp(name, "gear:s") == 0){
+static int set_chunk_func(const std::string& name){
+	if (name == "gear:s") {
 		chunk_f = chunking_phase_one_serial_gear;
 		consistent_check = 0;
-	} else if (strcmp(name, "gear:p") == 0)
+	}
+	else if (name == "gear:p")
 		chunk_f = chunking_phase_one_parallel_gear;
-	else if (strcmp(name, "crc:s") == 0){
+	else if (name == "crc:s") {
 		chunk_f = chunking_phase_one_serial_crc;
 		consistent_check = 0;
-	} else if (strcmp(name, "crc:p0") == 0)
+	}
+	else if (name == "crc:p0")
 		chunk_f = chunking_phase_one_parallel_crcv0;
-	else if (strcmp(name, "crc:p1") == 0)
+	else if (name == "crc:p1")
 		chunk_f = chunking_phase_one_parallel_crcv1;
 	else{
 		print_valid_hash_funcs();
@@ -294,7 +347,7 @@ int parse_args(int argc, char *argv[]){
 		}
 	}
 
-	if (hash_name == NULL){
+	if (hash_name.empty()){
 		hash_name = "crc:p1";
 	} 
 
@@ -627,70 +680,80 @@ static int init_fs(struct file_struct *fs){
 	}
 	printf("map_file seems successful\n");
 
-	assert( 0 == posix_memalign(reinterpret_cast<void**>(&fs->breakpoint_bm), 64, (fs->length+7)/8+HASHLEN/8));
-	bzero(fs->breakpoint_bm, (fs->length+7)/8 + HASHLEN/8);
+	const auto bitmap_size = (fs->length+7)/8 + HASHLEN/8;
+	fs->breakpoint_bm = static_cast<uint8_t*>(portable_aligned_alloc(64, bitmap_size));
 	if(!fs->breakpoint_bm){
 		printf("Error: allocate breakpoint bitmap failed, exit\n");
 		return 1;
 	}
+	std::memset(fs->breakpoint_bm, 0, bitmap_size);
 
-	assert( 0 == posix_memalign(reinterpret_cast<void**>(&fs->breakpoint_bm_base), 64, (fs->length+7)/8+HASHLEN/8));
-	bzero(fs->breakpoint_bm_base, (fs->length+7)/8 + HASHLEN/8);
+	fs->breakpoint_bm_base = static_cast<uint8_t*>(portable_aligned_alloc(64, bitmap_size));
 	if(!fs->breakpoint_bm_base){
 		printf("Error: allocate breakpoint bitmap failed, exit\n");
 		return 1;
 	}
-
+	std::memset(fs->breakpoint_bm_base, 0, bitmap_size);
 
 	return 0;
 }
 
 
-static void finialize_fs(struct file_struct *fs)
+static void finalize_fs(struct file_struct *fs)
 {
 	if(fs->breakpoint_bm)
-		free(fs->breakpoint_bm);
+		portable_aligned_free(fs->breakpoint_bm);
 	if(fs->breakpoint_bm_base)
-		free(fs->breakpoint_bm_base);
+		portable_aligned_free(fs->breakpoint_bm_base);
 	fs->test_length = fs->length = fs->next_start = 0;
 	unmap_file(fs);
 }
 
 
-static dirent **namelist = NULL;
-static int num_files;
+static int num_files = 0;
+static std::vector<std::filesystem::directory_entry> files;
 
-static int filter(const struct dirent *de)
-{
-	if (de->d_type == DT_REG && strcmp(de->d_name, ".") != 0)
-		return 1;
-	return 0;
+static bool filter(const std::filesystem::directory_entry& entry) {
+	return entry.is_regular_file() && entry.path().filename() != ".";
 }
 
-static int collect_files(char *dir){
-	num_files = scandir(dir, &namelist, filter, alphasort);
-	if (num_files < 0){
-		perror("scandir");
-		return 0;
-	} else {
-		if (num_files_test == 0)
+static int collect_files(const std::string& dir) {
+	files.clear();
+	try {
+		for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+			if (filter(entry)) {
+				files.push_back(entry);
+			}
+		}
+
+		// Sort alphabetically by filename
+		std::ranges::sort(files, [](const std::filesystem::directory_entry& a, const std::filesystem::directory_entry& b) {
+			return a.path().filename() < b.path().filename();
+		});
+
+		num_files = static_cast<int>(files.size());
+		if (num_files_test == 0) {
 			num_files_test = num_files;
-		printf("Info: tatal %d files in %s, %d files to be tested\n", num_files, dir, num_files_test);
+		}
+
+		std::cout << "Info: total " << num_files << " files in " << dir
+				  << ", " << num_files_test << " files to be tested\n";
+
 		return num_files;
+
+	} catch (const std::filesystem::filesystem_error& e) {
+		std::cerr << "Filesystem error: " << e.what() << "\n";
+		return 0;
 	}
 }
-static char *next_file(char *filename){
-	if (num_files <= 0)
-		return NULL;
 
-	strcpy(filename, namelist[--num_files]->d_name);
-	free(namelist[num_files]);
-	//printf("Processing %s\n",filename);
-	return filename;
+static std::string next_file(){
+	if (num_files <= 0) return "";
+	return files[--num_files].path().string();
 }
 
-static void clear_files(){
-	free(namelist);
+static void clear_files() {
+	files.clear();
 }
 
 
@@ -707,7 +770,7 @@ static void run_chunking_with_timer(){
 	uint64_t start_ticks_s, end_ticks_s;
 	phase_one_func sfunc = NULL;
 
-	if(strstr(hash_name, ":p")){
+	if(hash_name.find(":p") != std::string::npos) {
 			start = time_nsec();
 			start_ticks = getticks();
 			chunk_f(&fs);
@@ -717,11 +780,13 @@ static void run_chunking_with_timer(){
 			dedup_stats.avx_cycles += elapsed(end_ticks, start_ticks);
 
 			if(consistent_check){
-				if(strstr(hash_name, "crc")){
+				if(hash_name.find("crc") != std::string::npos) {
 					sfunc = chunking_phase_one_serial_crc;
-				}else if(strstr(hash_name, "gear")){
+				}
+				else if(hash_name.find("gear") != std::string::npos) {
 					sfunc = chunking_phase_one_serial_gear;
-				}else
+				}
+				else
 					assert(0);
 
 				start_s = time_nsec();
@@ -734,11 +799,12 @@ static void run_chunking_with_timer(){
 
 				if (skip_mini == 0)
 					bitmap_consistency_test(&fs);
-				else
+				else {
 					//printf("Warning: consistent_check skipped because skip_mini enabled\n");
-					;
+				}
 			}
-	}else{
+	}
+	else{
 			start = time_nsec();
 			chunk_f(&fs);
 			end = time_nsec();
