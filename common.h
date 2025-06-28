@@ -3,24 +3,24 @@
 
 #define _XOPEN_SOURCE 500
 #include "cycle.h"
-#include <stdio.h>
+#include <cstdio>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <unistd.h>
-#include <stdint.h>
+#include <cstdint>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/mman.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cstdlib>
+#include <cstring>
 #include <immintrin.h>
-#include <assert.h>
-#include <time.h>
-#include <openssl/sha.h>
+#include <cassert>
+#include <ctime>
 #include <dirent.h>
 
-#include <string>
 #include <unordered_set>
+
+#include "xxhash.h"
 
 #define HASHLEN 256
 
@@ -529,11 +529,6 @@ static int next_chunk(struct file_struct *fs, struct chunk_boundary *cb){
 	return 1;
 }
 
-
-static inline void compute_fingerprint(struct file_struct *fs, struct chunk_boundary *cb, uint8_t *hash){
-	SHA1((uint8_t*)fs->map+cb->left, cb->right-cb->left, hash);
-}
-
 static inline void print_fingerprint(uint8_t *hash, int len){
 	for(int i=0; i<len; i++){
 		printf("%x", hash[i]);
@@ -588,9 +583,9 @@ static void print_stats(char *opt){
 }
 
 static int chunking_phase_two(struct file_struct *fs){
-	std::unordered_set<std::string> known_fingerprints{};
+	std::unordered_set<uint64_t> known_fingerprints{};
 	struct chunk_boundary cb;
-	uint8_t hash[SHA_DIGEST_LENGTH];
+	uint64_t hash;
 	int i = 0;
 	uint64_t num_chunks = 0, uniq_chunks = 0;
 	uint64_t s_time;
@@ -609,15 +604,13 @@ static int chunking_phase_two(struct file_struct *fs){
 	fs->next_start = 0;
 
 	while(next_chunk(fs, &cb)){
-		bzero(hash, SHA_DIGEST_LENGTH);
 		s_time = time_nsec();
-		compute_fingerprint(fs, &cb, hash);
+		hash = XXH3_64bits((uint8_t*)fs->map + cb.left, cb.right - cb.left);
 		dedup_stats.dedup_ns += time_nsec() - s_time;
 		dedup_stats.total_chunks++;
 		dedup_stats.total_size += cb.right - cb.left;
-		const auto hash_str = std::string(reinterpret_cast<char*>(&hash), SHA_DIGEST_LENGTH);
-		if(known_fingerprints.find(hash_str) == known_fingerprints.end()){
-			known_fingerprints.insert(hash_str);
+		if(!known_fingerprints.contains(hash)){
+			known_fingerprints.insert(hash);
 			uniq_chunks++;
 			dedup_stats.uniq_size+= cb.right-cb.left;
 			dedup_stats.uniq_chunks ++;
