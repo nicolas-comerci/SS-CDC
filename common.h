@@ -19,6 +19,7 @@
 #include <cassert>
 #include <ctime>
 #include <filesystem>
+#include <format>
 #include <iostream>
 #include <unordered_set>
 #include <vector>
@@ -52,9 +53,9 @@ static uint64_t segment_size = 1*1024*1024;
 static uint32_t break_mask_bit = 14;
 static uint32_t break_mask = (1u<<break_mask_bit)-1;
 static uint32_t magic_number = 0;
-static int skip_mini = 0;
-static int consistent_check = 0;
-static int force_segment = 0;
+static bool skip_mini = false;
+static bool consistent_check = false;
+static bool force_segment = false;
 
 
 //[left, right)
@@ -64,10 +65,10 @@ struct chunk_boundary{
 };
 
 #ifndef _MSC_VER
-#define vector_idx(table,idx) \
+#define vector_idx(table, idx) \
 	((__v16si)table)[idx]
 #else
-#define vector_idx(table,idx) \
+#define vector_idx(table, idx) \
 	table.m512i_i32[idx]
 #endif
 
@@ -145,12 +146,12 @@ static const uint32_t crcu[256] =
 
 
 struct file_struct{
-	char *fname;
+	char* filename;
 	uint64_t length, test_length;
 	std::FILE* fd;
-	void *map;
-	uint8_t *breakpoint_bm;
-	uint8_t *breakpoint_bm_base; // for serial chunking method as the base
+	void* map;
+	uint8_t* breakpoint_bm_parallel;
+	uint8_t* breakpoint_bm_serial;
 	uint64_t next_start;  // next chunk start, used by next_chunk()
 };
 
@@ -179,41 +180,41 @@ inline void portable_aligned_free(void* ptr) {
 }
 
 
-static void *map_file(struct file_struct *fs){
+static void* map_file(file_struct& fs){
 #ifndef _WIN32
-	fs->fd = fdopen(open(fs->fname, O_LARGEFILE|O_NOATIME), "rb");
+	fs.fd = fdopen(open(fs.fname, O_LARGEFILE|O_NOATIME), "rb");
 #else
-	fs->fd = std::fopen(fs->fname, "rb");
+	fs.fd = std::fopen(fs.filename, "rb");
 #endif
-	if (fs->fd == nullptr) {
+	if (fs.fd == nullptr) {
 		printf("Bad file descriptor?!\n");
-		return NULL;
+		return nullptr;
 	}
 #ifndef _WIN32
-	std::fseek(fs->fd, 0, SEEK_END);
-	fs->length = std::ftell(fs->fd);
+	std::fseek(fs.fd, 0, SEEK_END);
+	fs.length = std::ftell(fs.fd);
 #else
-	_fseeki64(fs->fd, 0, SEEK_END);
-	fs->length = _ftelli64(fs->fd);
+	_fseeki64(fs.fd, 0, SEEK_END);
+	fs.length = _ftelli64(fs.fd);
 #endif
 
-	if (fs->test_length == 0 || fs->test_length > fs->length)
-		fs->test_length = fs->length;
-	printf("length: %llu test_length %llu\n", fs->length, fs->test_length);
+	if (fs.test_length == 0 || fs.test_length > fs.length)
+		fs.test_length = fs.length;
+	printf("length: %llu test_length %llu\n", fs.length, fs.test_length);
 		
 #if USE_MEMALLOC || _WIN32
 	printf("Allocating memory for file\n");
-	fs->map = portable_aligned_alloc(64, (fs->length+63)/64*64+HASHLEN);
-	if(fs->map == nullptr){
+	fs.map = portable_aligned_alloc(64, (fs.length+63)/64*64+HASHLEN);
+	if(fs.map == nullptr){
 		printf("Bad alloc?!\n");
-		return NULL;
+		return nullptr;
 	}
 	printf("Memory allocated, reading file\n");
-	std::fseek(fs->fd, 0, SEEK_SET);
+	std::fseek(fs.fd, 0, SEEK_SET);
 	uint64_t read_size = 0;
-	while (read_size < fs->length) {
-		const uint64_t to_read_size = std::min<uint64_t>(fs->length - read_size, std::numeric_limits<size_t>::max());
-		const auto actually_read = std::fread(static_cast<uint8_t*>(fs->map) + read_size, 1, to_read_size, fs->fd);
+	while (read_size < fs.length) {
+		const uint64_t to_read_size = std::min<uint64_t>(fs.length - read_size, std::numeric_limits<size_t>::max());
+		const auto actually_read = std::fread(static_cast<uint8_t*>(fs.map) + read_size, 1, to_read_size, fs.fd);
 		if (to_read_size != actually_read) {
 			printf("Reading file failed\n");
 			return nullptr;
@@ -221,75 +222,71 @@ static void *map_file(struct file_struct *fs){
 		read_size += to_read_size;
 	}
 	printf("Read, zeroing memory\n");
-	std::memset(static_cast<uint8_t *>(fs->map) + fs->length, 0, HASHLEN);
+	std::memset(static_cast<uint8_t *>(fs.map) + fs.length, 0, HASHLEN);
 	printf("Done\n");
 #else
-	void *tmp = mmap(NULL, fs->length + HASHLEN, PROT_READ, MAP_PRIVATE, fileno(fs->fd), 0);
+	void *tmp = mmap(NULL, fs.length + HASHLEN, PROT_READ, MAP_PRIVATE, fileno(fs.fd), 0);
 	if (tmp == MAP_FAILED) {
 		printf("Map Failed!\n");
-		return NULL;
+		return nullptr;
 	}
 	printf("Map success!\n");
-	fs->map = tmp;
+	fs.map = tmp;
 #endif
 
-	return fs->map;
+	return fs.map;
 }
 
-static void unmap_file(struct file_struct *fs){
-	if(fs->map != nullptr){
+static void unmap_file(file_struct& fs){
+	if(fs.map != nullptr){
 #if USE_MEMALLOC
-		portable_aligned_free(fs->map);
+		portable_aligned_free(fs.map);
 #else
-		munmap(fs->map, fs->length+HASHLEN);
+		munmap(fs.map, fs.length+HASHLEN);
 #endif
 	}
-	if (fs->fd != nullptr)
-		std::fclose(fs->fd);
+	if (fs.fd != nullptr)
+		std::fclose(fs.fd);
 }
 
-static struct file_struct fs = {NULL, 0, 0, nullptr, NULL, NULL, 0};
-static char *dir = NULL;
-typedef int (*phase_one_func)(struct file_struct *fs);
-static phase_one_func chunk_f = NULL;
-static int num_files_test = 0;
+static struct file_struct fs = { nullptr, 0, 0, nullptr, nullptr, nullptr, 0 };
+static char *dir = nullptr;
+typedef void (*phase_one_func)(file_struct& fs);
+static phase_one_func chunk_f = nullptr;
+static uint64_t num_files_test = 0;
 static std::string hash_name{};
 
-int chunking_phase_one_serial_gear(struct file_struct *fs);
-int chunking_phase_one_parallel_gear(struct file_struct *fs);
-int chunking_phase_one_serial_crc(struct file_struct *fs);
-int chunking_phase_one_parallel_crcv0(struct file_struct *fs);
-int chunking_phase_one_parallel_crcv1(struct file_struct *fs);
+void chunking_phase_one_serial_gear(file_struct& fs);
+void chunking_phase_one_parallel_gear(file_struct& fs);
+void chunking_phase_one_serial_crc(file_struct& fs);
+void chunking_phase_one_parallel_crc(file_struct& fs);
 
 static void print_valid_hash_funcs() {
 	printf("Only Valid hash function as below accepted: ");
-	printf(" gear:s ; ");
+	printf("gear:s ; ");
 	printf("gear:p ; ");
 	printf("crc:s ; ");
-	printf("crc:p0 ; ");
-	printf("crc:p1 \n");
+	printf("crc:p \n");
 }
 
-static int set_chunk_func(const std::string& name){
+static bool set_chunk_func(const std::string& name){
 	if (name == "gear:s") {
 		chunk_f = chunking_phase_one_serial_gear;
-		consistent_check = 0;
+		consistent_check = false;
 	}
 	else if (name == "gear:p")
 		chunk_f = chunking_phase_one_parallel_gear;
 	else if (name == "crc:s") {
 		chunk_f = chunking_phase_one_serial_crc;
-		consistent_check = 0;
+		consistent_check = false;
 	}
-	else if (name == "crc:p0")
-		chunk_f = chunking_phase_one_parallel_crcv0;
-	else if (name == "crc:p1")
-		chunk_f = chunking_phase_one_parallel_crcv1;
+	else if (name == "crc:p")
+		chunk_f = chunking_phase_one_parallel_crc;
 	else{
 		print_valid_hash_funcs();
-		return 1;
+		return false;
 	}
-	return 0;
+	return true;
 }
 
 
@@ -299,11 +296,11 @@ static inline void help(){
 	print_valid_hash_funcs();
 }
 
-int parse_args(int argc, char *argv[]){
-	for (int i=1; i<argc; i++){
+bool parse_args(int argc, char *argv[]){
+	for (int i = 1; i < argc; i++){
 		if(strncmp(argv[i], "-f", 2) == 0){
 			assert(i<argc-1);
-			fs.fname = argv[i+1];
+			fs.filename = argv[i+1];
 			i++;
 		}else if(strncmp(argv[i], "-m", 2) == 0){
 			assert(i<argc-1);
@@ -327,7 +324,7 @@ int parse_args(int argc, char *argv[]){
 			i++;
 		}else if(strncmp(argv[i], "-N", 2) == 0){
 			assert(i<argc-1);
-			num_files_test = atoi(argv[i+1]);
+			num_files_test = strtoull(argv[i+1], nullptr, 10);
 			i++;
 		}else if(strncmp(argv[i], "-bmb", 4) == 0){
 			assert(i<argc-1);
@@ -343,254 +340,247 @@ int parse_args(int argc, char *argv[]){
 			hash_name = argv[i+1];
 			i++;
 		} else if(strncmp(argv[i], "-skip", 5) == 0){
-			skip_mini = 1;
+			skip_mini = true;
 		}else if (strncmp(argv[i], "-cc", 3) == 0){
-			consistent_check = 1;
+			consistent_check = true;
 		}else if (strncmp(argv[i], "-S", 2) == 0){
-			force_segment = 1;
+			force_segment = true;
 		}else{
 			help();
-			return 1;
+			return false;
 		}
 	}
 
 	if (hash_name.empty()){
-		hash_name = "crc:p1";
+		hash_name = "crc:p";
 	} 
 
-	if (set_chunk_func(hash_name))
-		return 1;
+	if (!set_chunk_func(hash_name))
+		return false;
 
 	//printf("INFO: hash %s\n", hash_name);
-	if (fs.fname == NULL && dir == NULL){
+	if (fs.filename == nullptr && dir == nullptr){
 		help();
-		return 1;
+		return false;
 	}
-	else
-		return 0;
+
+	return true;
 }
 
 
-static int bitmap_consistency_test(struct file_struct *fs){
+static void bitmap_consistency_test(file_struct& fs) {
 	uint32_t bp_count = 0;
 
-	if(skip_mini){
+	if(skip_mini) {
 		//printf("Warning: consistent_check skipped because skip_mini enabled\n");
-		consistent_check = 0;
-		return 1;
+		consistent_check = false;
+		return;
 	}
 
-	if(fs->breakpoint_bm_base == NULL || fs->breakpoint_bm == NULL)
-	{
+	if(fs.breakpoint_bm_serial == nullptr || fs.breakpoint_bm_parallel == nullptr) {
 		printf("Bitmap not allocated\n");
-		return 0;
+		return;
 	}
-	for(int i=0; i<fs->test_length; i+=8){
-		if(fs->breakpoint_bm[i/8] != fs->breakpoint_bm_base[i/8]){
-			printf("%s: Bitmap not consistent at offset %x (%d), total length %lu\n", fs->fname, i+i%8, i+i%8, fs->test_length);
-			return 0;
+	for(uint64_t i = 0; i < fs.test_length; i += 8) {
+		if(fs.breakpoint_bm_parallel[i/8] != fs.breakpoint_bm_serial[i/8]) {
+			printf("%s: Bitmap not consistent at offset %x (%d), total length %lu\n", fs.filename, i+i%8, i+i%8, fs.test_length);
+			return;
 		}
-		if (fs->breakpoint_bm[i/8] > 0){
+		if (fs.breakpoint_bm_parallel[i/8] > 0) {
 			bp_count++;
 		}
 	}
 
-	//printf("Processing %s, %lu bytes and %u break points detected\n", fs->fname, fs->test_length, bp_count);
-	return 1;
+	//printf("Processing %s, %lu bytes and %u break points detected\n", fs.fname, fs.test_length, bp_count);
 }
 
-static inline int reach_end(struct file_struct *fs){
-	return fs->length <= fs->next_start;
+static inline uint64_t reach_end(const file_struct& fs){
+	return fs.length <= fs.next_start;
 }
 
-static inline uint64_t bytes_left(struct file_struct *fs){
-	return fs->length - fs->next_start;
+static inline uint64_t bytes_left(const file_struct& fs){
+	return fs.length - fs.next_start;
 }
 
-static inline int is_breakpoint(struct file_struct *fs, uint64_t idx){
-	uint8_t b = fs->breakpoint_bm[idx/8];
-	return ((b>>(idx%8)) & 0x1);
+static inline bool is_breakpoint(const uint8_t* cutpoint_bitmap, uint64_t idx){
+	uint8_t b = cutpoint_bitmap[idx/8];
+	return ((b>>(idx%8)) & 0x1) == 1;
 }
 
-static int cut_chunks_serial(struct file_struct *fs)
-{
+static void cut_chunks_serial(file_struct& fs, const uint8_t* cutpoint_bitmap) {
 	uint64_t i;
 
-	while(fs->next_start < fs->length)
-	{
+	while(fs.next_start < fs.length) {
 		if (reach_end(fs))
-			return 0;
-		if (bytes_left(fs) < 2 * min_chunksize){
-			fs->next_start = fs->length;
-			return 1;
+			return;
+		if (bytes_left(fs) < 2 * min_chunksize) {
+			fs.next_start = fs.length;
+			return;
 		}
 
-		// printf("cut chunk serial idx out: %lu\n", fs->next_start);
-		for(i = min_chunksize; i < max_chunksize && i+fs->next_start < fs->length; i++)
-		{
-			if (is_breakpoint(fs, fs->next_start+i))
+		// printf("cut chunk serial idx out: %lu\n", fs.next_start);
+		for(i = min_chunksize; i < max_chunksize && i+fs.next_start < fs.length; i++) {
+			if (is_breakpoint(cutpoint_bitmap, fs.next_start+i))
 				break;
 		}
 
-		fs->next_start += i+1;
+		fs.next_start += i+1;
 	}
-
-	return 1;
 }
 
-static int cut_chunks(struct file_struct *fs){
-	uint64_t i;
-	int v=0;
-	int s = 0;
+static void cut_chunks_parallel(file_struct& fs, const uint8_t* cutpoint_bitmap) {
+	uint64_t current_chunk_size;
 	__m512i vindex = _mm512_setr_epi32(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
 	__m512i zero_v = _mm512_set1_epi32(0);
 
-	while(fs->next_start < fs->length){
-		//printf("idx: %lu\n", fs->next_start-1);
+	while(fs.next_start < fs.length) {
+		//printf("idx: %lu\n", fs.next_start-1);
 		if (reach_end(fs))
-			return 0;
-		if (bytes_left(fs) < 2 * min_chunksize){
-			fs->next_start = fs->length;
-			return 1;
+			return;
+		if (bytes_left(fs) < 2ull * min_chunksize) {
+			fs.next_start = fs.length;
+			return;
 		}
-		// printf("cut chunk idx out:%lu\n", fs->next_start);
-		for (i=min_chunksize; i<max_chunksize && i+fs->next_start < fs->length; ){
-			//printf("idx:%lu\n", i+fs->next_start);
-			int offset = (i+fs->next_start)%8;
-		if (offset != 0){
-			uint8_t b = fs->breakpoint_bm[(i+fs->next_start)/8];
-			b = b >> offset;
-			if (b){
-				while ((b&0x1)==0){
-					i++;
-					b=b>>1;
+		// printf("cut chunk idx out:%lu\n", fs.next_start);
+		for (current_chunk_size=min_chunksize; current_chunk_size<max_chunksize && current_chunk_size+fs.next_start < fs.length; ) {
+			//printf("idx:%lu\n", current_chunk_size+fs.next_start);
+			uint64_t offset = (current_chunk_size+fs.next_start)%8;
+			if (offset != 0) {
+				uint8_t b = cutpoint_bitmap[(current_chunk_size + fs.next_start) / 8];
+				b = b >> offset;
+				if (b){
+					while ((b&0x1)==0) {
+						current_chunk_size++;
+						b=b>>1;
+					}
+					//fs.next_start += current_chunk_size+1;
+					break;
 				}
-				//fs->next_start += i+1;
-				break;
-			}else{
-				i+=8-offset;
+				else {
+					current_chunk_size+=8-offset;
+				}
 			}
+			__m512i bm = _mm512_i32gather_epi32(vindex, &cutpoint_bitmap[(current_chunk_size + fs.next_start) / 8], 4);
+			// __m512i bit = _mm512_lzcnt_epi32(bm);
+			__mmask16 lane_has_result_bitmask = _mm512_cmpneq_epi32_mask(bm, zero_v);
+			if (lane_has_result_bitmask == 0) {
+				current_chunk_size += 512ull;
+				continue;
+			}
+			uint8_t lane_i = 0;
+			while (((lane_has_result_bitmask >> lane_i) & 0x1) == 0) {
+				lane_i++;
+			}
+			int32_t lane_bitmap = vector_idx(bm, lane_i);
+			current_chunk_size += 32ull * lane_i;
+			uint8_t bit_i = 0;
+			while(((lane_bitmap >> bit_i)&0x1) == 0)
+				bit_i++;
+			current_chunk_size += bit_i;
+
+			//fs.next_start += current_chunk_size+1;
+			break;
 		}
-		__m512i bm = _mm512_i32gather_epi32(vindex, (void*)(fs->breakpoint_bm+(i+fs->next_start)/8), 4);
-		// __m512i bit = _mm512_lzcnt_epi32(bm);
-		__mmask16 r = _mm512_cmpneq_epi32_mask(bm, zero_v);
-		if (r == 0){
-			i+=512;
+		//if (current_chunk_size >= max_chunksize)
+			fs.next_start += current_chunk_size+1;
+	}
+}
+
+
+static void next_chunk_parallel(file_struct& fs, uint64_t& current_chunk_size) {
+	__m512i vindex = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+	__m512i zero_v = _mm512_set1_epi32(32);
+	for (current_chunk_size = min_chunksize; current_chunk_size < max_chunksize && current_chunk_size + fs.next_start < fs.length; ) {
+		uint64_t offset = (current_chunk_size + fs.next_start) % 8;
+		if (offset > 0) {
+			uint8_t b = fs.breakpoint_bm_parallel[(current_chunk_size + fs.next_start) / 8];
+			b = b >> offset;
+			if (b) {
+				while ((b & 0x1) == 0) {
+					current_chunk_size++;
+					b = b >> 1;
+				}
+				//printf("start %lu offset %d idx2: %lu\n", fs.next_start, offset ,current_chunk_size+fs.next_start);
+				//printf("idx: %lu\n", current_chunk_size+fs.next_start);
+				break;
+			}
+			else
+				current_chunk_size += 8 - offset;
+		}
+		__m512i bm = _mm512_i32gather_epi32(vindex, &fs.breakpoint_bm_parallel[(current_chunk_size + fs.next_start) / 8], 4);
+		__m512i bit = _mm512_lzcnt_epi32(bm);
+		__mmask16 r = _mm512_cmpneq_epi32_mask(bit, zero_v);
+		if (r == 0) {
+			current_chunk_size += 512;
+			//printf("r: %x bit[0] %x idx %lu\n", r, vector_idx(bm, 0), current_chunk_size+fs.next_start);
 			continue;
 		}
-		else{
-			s = 0;
-			while(((r>>s)&0x1) == 0){
-				s++;
-			}
-			v = vector_idx(bm, s);
-			i+=s*32;
+		uint8_t lane_i = 0;
+		while (((r >> lane_i) & 0x1) == 0) {
+			lane_i++;
 		}
-		s=0;
-		while(((v>>s)&0x1) == 0)
-			s++;
-		i+=s;
-
-		//fs->next_start += i+1;
+		int32_t lane_bitmap = vector_idx(bm, lane_i);
+		current_chunk_size += 32ull * lane_i;
+		//printf("r: %x bm[s] %x idx %lu s %d %d ", r, vector_idx(bm, s), current_chunk_size+fs.next_start, s, vector_idx(vindex*32,2));
+		uint8_t bit_i = 0;
+		while (((lane_bitmap >> bit_i) & 0x1) == 0)
+			bit_i++;
+		current_chunk_size += bit_i;
+		if (force_segment) {
+			if ((current_chunk_size + fs.next_start) % segment_size < fs.next_start % segment_size) {
+				current_chunk_size -= (current_chunk_size + fs.next_start) % segment_size;
+				//printf("idx: %lu\n", current_chunk_size+fs.next_start);
+				break;
+			}
+		}
+		//printf("v %x idx: %lu\n", v, current_chunk_size+fs.next_start);
+		//printf("idx: %lu\n", current_chunk_size+fs.next_start);
 		break;
 	}
-	//if (i >= max_chunksize)
-		fs->next_start += i+1;
-}
-	return 1;
 }
 
 
-
-
-static int next_chunk(struct file_struct *fs, struct chunk_boundary *cb){
-	uint64_t i;
-	int v=0;
-	int s = 0;
-	__m512i vindex = _mm512_setr_epi32(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
-	__m512i zero_v = _mm512_set1_epi32(32);
+static bool next_chunk(file_struct& fs, struct chunk_boundary *cb, bool use_parallel){
+	uint64_t current_chunk_size;
 
 	assert(cb);
 	if (reach_end(fs))
-		return 0;
-	if (bytes_left(fs) < 2 * min_chunksize){
-		cb->left = fs->next_start;
-		cb->right = fs->length;
-		fs->next_start = cb->right;
-		return 1;
+		return false;
+	if (bytes_left(fs) < 2 * min_chunksize) {
+		cb->left = fs.next_start;
+		cb->right = fs.length;
+		fs.next_start = cb->right;
+		return true;
 	}
 
-	if(force_segment && segment_size - fs->next_start%segment_size < 2*min_chunksize){
-		cb->left = fs->next_start;
-		cb->right = fs->next_start + segment_size - fs->next_start%segment_size;
-		fs->next_start = cb->right;
-		return 1;
+	if(force_segment && segment_size - fs.next_start%segment_size < 2*min_chunksize) {
+		cb->left = fs.next_start;
+		cb->right = fs.next_start + segment_size - fs.next_start%segment_size;
+		fs.next_start = cb->right;
+		return true;
 	}
 
-	for (i=min_chunksize; i<max_chunksize && i+fs->next_start < fs->length; ){
-#if 1
-		int offset = (i+fs->next_start)%8;
-		if (offset > 0){
-			uint8_t b = fs->breakpoint_bm[(i+fs->next_start)/8];
-			b = b >> offset;
-			if (b){
-				while ((b&0x1) == 0){
-					i++; 
-					b = b>>1;
-				}
-				//printf("start %lu offset %d idx2: %lu\n", fs->next_start, offset ,i+fs->next_start);
-				//printf("idx: %lu\n", i+fs->next_start);
-				break;
-			}else
-				i += 8-offset;
-		}
-		__m512i bm = _mm512_i32gather_epi32(vindex, (void*)(fs->breakpoint_bm+(i+fs->next_start)/8), 4);
-		__m512i bit = _mm512_lzcnt_epi32(bm);
-		__mmask16 r = _mm512_cmpneq_epi32_mask(bit, zero_v);
-		if (r == 0){
-			i+=512;
-			//printf("r: %x bit[0] %x idx %lu\n", r, vector_idx(bm, 0), i+fs->next_start);
-			continue;
-		}
-		else{
-			while(((r>>s)&0x1) == 0){
-				s++;
-			}
-			v = vector_idx(bm, s);
-			i+=s*32;
-		}
-		//printf("r: %x bm[s] %x idx %lu s %d %d ", r, vector_idx(bm, s), i+fs->next_start, s, vector_idx(vindex*32,2));
-		s=0;
-		while(((v>>s)&0x1) == 0)
-			s++;
-		i+=s;
-		if (force_segment){
-			if( (i+fs->next_start)%segment_size < fs->next_start%segment_size){
-				i -= (i+fs->next_start)%segment_size;
-				//printf("idx: %lu\n", i+fs->next_start);
+	if (use_parallel) {
+		next_chunk_parallel(fs, current_chunk_size);
+	}
+	else {
+		for (current_chunk_size = min_chunksize; current_chunk_size < max_chunksize && current_chunk_size + fs.next_start < fs.length; ) {
+			if (is_breakpoint(fs.breakpoint_bm_serial, current_chunk_size + fs.next_start)) {
+				//printf("idx: %lu\n", current_chunk_size+fs.next_start);
 				break;
 			}
+			current_chunk_size++;
 		}
-		//printf("v %x idx: %lu\n", v, i+fs->next_start);
-		//printf("idx: %lu\n", i+fs->next_start);
-		break;
-#else
-		if(is_breakpoint(fs, i+fs->next_start)){
-			//printf("idx: %lu\n", i+fs->next_start);
-			break;
-		}
-		i++;
-#endif
 	}
 
-	cb->left = fs->next_start;
-	cb->right = i+fs->next_start+1;
-	fs->next_start = cb->right;
-	return 1;
+	cb->left = fs.next_start;
+	cb->right = current_chunk_size+fs.next_start+1;
+	fs.next_start = cb->right;
+	return true;
 }
 
-static inline void print_fingerprint(uint8_t *hash, int len){
-	for(int i=0; i<len; i++){
+static inline void print_fingerprint(uint8_t *hash, uint64_t len){
+	for(uint64_t i = 0; i < len; i++){
 		printf("%x", hash[i]);
 	}
 	printf("\n");
@@ -614,58 +604,65 @@ struct dedup_stats_st{
 	
 static struct dedup_stats_st dedup_stats={0,0,0,0,0,0,0,0,0, 0.0, 0.0};
 
-static void print_stats(char *opt){
-	if (strlen(opt) > 0) {
-		printf("Output: mini_chunksize %u max_chunksize %u expect_avg_chunksize %u magic_number %d seg_size %lu %s", min_chunksize, max_chunksize, 1<<break_mask_bit, magic_number, segment_size, opt);
-	}else{
-		printf("Output: mini_chunksize %u max_chunksize %u expect_avg_chunksize %u magic_number %d seg_size %lu", min_chunksize, max_chunksize, 1<<break_mask_bit, magic_number, segment_size);
+static void print_stats(std::string opt){
+	printf(std::format(
+		"Output: mini_chunksize {} max_chunksize {} expect_avg_chunksize {} magic_number {} seg_size {}",
+		min_chunksize, max_chunksize, 1<<break_mask_bit, magic_number, segment_size).c_str()
+	);
+	if (!opt.empty()) {
+		printf(" %s", opt.c_str());
 	}
-	printf(" force_segment %d skip_mini %d unique_bytes %lu total_bytes %lu unique_chunks %lu total_chunks %lu dedup_ratio %.2f avg_chunk_size %.2f", force_segment, skip_mini, dedup_stats.uniq_size, dedup_stats.total_size, dedup_stats.uniq_chunks, dedup_stats.total_chunks, 1.0*dedup_stats.total_size/dedup_stats.uniq_size, dedup_stats.total_size/dedup_stats.total_chunks*1.0);
+	printf(std::format(
+		" force_segment {} skip_mini {} unique_bytes {} total_bytes {} unique_chunks {} total_chunks {} dedup_ratio {:.2f} avg_chunk_size {:.2f}",
+		force_segment, skip_mini, dedup_stats.uniq_size, dedup_stats.total_size, dedup_stats.uniq_chunks,
+		dedup_stats.total_chunks, 1.0*dedup_stats.total_size/dedup_stats.uniq_size, dedup_stats.total_size/dedup_stats.total_chunks*1.0).c_str()
+	);
 
-	if(consistent_check)
-		printf(" break_time %lu break_serial_time %lu speedup %.2f dedup_time %lu chunk_time_parallel %lu chunk_time_serial %lu speedup %.2f chunk_cycles_parallel %.2f, chunk_cycles_serial %.2f chunk_cycles_speedup %.2f cycles_per_byte_parallel %.2f cycles_per_byte_serial %.2f \n", 
+	printf(std::format(" break_time {} break_serial_time {} speedup {:.2f} dedup_time {} chunk_time_parallel {} chunk_time_serial {}",
 		dedup_stats.break_ns, dedup_stats.break_serial_ns,
-		1.0*dedup_stats.break_serial_ns/dedup_stats.break_ns, 
-		dedup_stats.dedup_ns, dedup_stats.avx_ns, dedup_stats.serial_ns, 
-		1.0*dedup_stats.serial_ns/dedup_stats.avx_ns, 
-		dedup_stats.avx_cycles, dedup_stats.serial_cycles, 
-		dedup_stats.serial_cycles/dedup_stats.avx_cycles, 
-		dedup_stats.avx_cycles/dedup_stats.total_size, 
-		dedup_stats.serial_cycles/dedup_stats.total_size);
+		1.0 * dedup_stats.break_serial_ns / dedup_stats.break_ns,
+		dedup_stats.dedup_ns,
+		dedup_stats.avx_ns,
+		dedup_stats.serial_ns
+	).c_str());
+	if(consistent_check)
+		printf(std::format(
+			" speedup {:.2f} chunk_cycles_parallel {:.2f}, chunk_cycles_serial {:.2f} chunk_cycles_speedup {:.2f} cycles_per_byte_parallel {:.2f} cycles_per_byte_serial {:.2f} \n", 
+			1.0 * dedup_stats.serial_ns / dedup_stats.avx_ns, 
+			dedup_stats.avx_cycles, dedup_stats.serial_cycles, 
+			dedup_stats.serial_cycles / dedup_stats.avx_cycles, 
+			dedup_stats.avx_cycles / dedup_stats.total_size, 
+			dedup_stats.serial_cycles / dedup_stats.total_size
+		).c_str());
 	else{
-		printf(" break_time %lu break_serial_time %lu speedup %.2f dedup_time %lu chunk_time_parallel %lu chunk_time_serial %lu speedup --\n", 
-			dedup_stats.break_ns, dedup_stats.break_serial_ns, 
-			1.0*dedup_stats.break_serial_ns/dedup_stats.break_ns, 
-			dedup_stats.dedup_ns, 
-			dedup_stats.avx_ns, 
-			dedup_stats.serial_ns);
+		printf(" speedup --\n");
 	}
 }
 
-static int chunking_phase_two(struct file_struct *fs){
+static void chunking_phase_two(file_struct& fs, bool use_parallel){
 	std::unordered_set<uint64_t> known_fingerprints{};
 	struct chunk_boundary cb;
 	uint64_t hash;
-	int i = 0;
 	uint64_t num_chunks = 0, uniq_chunks = 0;
 	uint64_t s_time;
+	const uint8_t* cutpoint_bitmap = use_parallel ? fs.breakpoint_bm_parallel : fs.breakpoint_bm_serial;
 
 	s_time = time_nsec();
 	//printf("cut time: %lu\n", dedup_stats.break_ns);
-	cut_chunks(fs);
+	cut_chunks_parallel(fs, cutpoint_bitmap);
 	dedup_stats.break_ns += time_nsec() - s_time;
 	//printf("cut time: %lu\n", dedup_stats.break_ns);
 
-	fs->next_start = 0;
+	fs.next_start = 0;
 	s_time = time_nsec();
-	cut_chunks_serial(fs);
+	cut_chunks_serial(fs, cutpoint_bitmap);
 	dedup_stats.break_serial_ns += time_nsec() - s_time;
 
-	fs->next_start = 0;
+	fs.next_start = 0;
 
-	while(next_chunk(fs, &cb)){
+	while(next_chunk(fs, &cb, use_parallel)){
 		s_time = time_nsec();
-		hash = XXH3_64bits((uint8_t*)fs->map + cb.left, cb.right - cb.left);
+		hash = XXH3_64bits(static_cast<uint8_t*>(fs.map) + cb.left, cb.right - cb.left);
 		dedup_stats.dedup_ns += time_nsec() - s_time;
 		dedup_stats.total_chunks++;
 		dedup_stats.total_size += cb.right - cb.left;
@@ -676,55 +673,53 @@ static int chunking_phase_two(struct file_struct *fs){
 			dedup_stats.uniq_chunks ++;
 		}
 	}
-	return 0;
 }
 
-static int init_fs(struct file_struct *fs){
+static bool init_fs(file_struct& fs){
 	printf("map_file starting\n");
-	if (map_file(fs) == NULL){
-		printf("Error: map file %s failed\n", fs->fname);
-		return 1;
+	if (map_file(fs) == nullptr){
+		printf("Error: map file %s failed\n", fs.filename);
+		return false;
 	}
 	printf("map_file seems successful\n");
 
-	const auto bitmap_size = (fs->length+7)/8 + HASHLEN/8;
-	fs->breakpoint_bm = static_cast<uint8_t*>(portable_aligned_alloc(64, bitmap_size));
-	if(!fs->breakpoint_bm){
+	const auto bitmap_size = (fs.length+7)/8 + HASHLEN/8;
+	fs.breakpoint_bm_parallel = static_cast<uint8_t*>(portable_aligned_alloc(64, bitmap_size));
+	if(!fs.breakpoint_bm_parallel){
 		printf("Error: allocate breakpoint bitmap failed, exit\n");
-		return 1;
+		return false;
 	}
-	std::memset(fs->breakpoint_bm, 0, bitmap_size);
+	std::memset(fs.breakpoint_bm_parallel, 0, bitmap_size);
 
-	fs->breakpoint_bm_base = static_cast<uint8_t*>(portable_aligned_alloc(64, bitmap_size));
-	if(!fs->breakpoint_bm_base){
+	fs.breakpoint_bm_serial = static_cast<uint8_t*>(portable_aligned_alloc(64, bitmap_size));
+	if(!fs.breakpoint_bm_serial){
 		printf("Error: allocate breakpoint bitmap failed, exit\n");
-		return 1;
+		return false;
 	}
-	std::memset(fs->breakpoint_bm_base, 0, bitmap_size);
+	std::memset(fs.breakpoint_bm_serial, 0, bitmap_size);
 
-	return 0;
+	return true;
 }
 
 
-static void finalize_fs(struct file_struct *fs)
-{
-	if(fs->breakpoint_bm)
-		portable_aligned_free(fs->breakpoint_bm);
-	if(fs->breakpoint_bm_base)
-		portable_aligned_free(fs->breakpoint_bm_base);
-	fs->test_length = fs->length = fs->next_start = 0;
+static void finalize_fs(file_struct& fs) {
+	if(fs.breakpoint_bm_parallel)
+		portable_aligned_free(fs.breakpoint_bm_parallel);
+	if(fs.breakpoint_bm_serial)
+		portable_aligned_free(fs.breakpoint_bm_serial);
+	fs.test_length = fs.length = fs.next_start = 0;
 	unmap_file(fs);
 }
 
 
-static int num_files = 0;
+static uint64_t num_files = 0;
 static std::vector<std::filesystem::directory_entry> files;
 
 static bool filter(const std::filesystem::directory_entry& entry) {
 	return entry.is_regular_file() && entry.path().filename() != ".";
 }
 
-static int collect_files(const std::string& dir) {
+static uint64_t collect_files(const std::string& dir) {
 	files.clear();
 	try {
 		for (const auto& entry : std::filesystem::directory_iterator(dir)) {
@@ -738,7 +733,7 @@ static int collect_files(const std::string& dir) {
 			return a.path().filename() < b.path().filename();
 		});
 
-		num_files = static_cast<int>(files.size());
+		num_files = files.size();
 		if (num_files_test == 0) {
 			num_files_test = num_files;
 		}
@@ -755,7 +750,7 @@ static int collect_files(const std::string& dir) {
 }
 
 static std::string next_file(){
-	if (num_files <= 0) return "";
+	if (num_files == 0) return "";
 	return files[--num_files].path().string();
 }
 
@@ -777,10 +772,11 @@ static void run_chunking_with_timer(){
 	uint64_t start_ticks_s, end_ticks_s;
 	phase_one_func sfunc = NULL;
 
-	if(hash_name.find(":p") != std::string::npos) {
+	const bool use_parallel = hash_name.find(":p") != std::string::npos;
+	if(use_parallel) {
 			start = time_nsec();
 			start_ticks = getticks();
-			chunk_f(&fs);
+			chunk_f(fs);
 			end_ticks = getticks();
 			end = time_nsec();
 			dedup_stats.avx_ns += end-start;
@@ -798,27 +794,27 @@ static void run_chunking_with_timer(){
 
 				start_s = time_nsec();
 				start_ticks_s = getticks();
-				sfunc(&fs);
+				sfunc(fs);
 				end_ticks_s = getticks();
 				end_s = time_nsec();
 				dedup_stats.serial_ns += end_s-start_s;
 				dedup_stats.serial_cycles += elapsed(end_ticks_s, start_ticks_s);
 
-				if (skip_mini == 0)
-					bitmap_consistency_test(&fs);
+				if (!skip_mini)
+					bitmap_consistency_test(fs);
 				else {
 					//printf("Warning: consistent_check skipped because skip_mini enabled\n");
 				}
 			}
 	}
-	else{
+	else {
 			start = time_nsec();
-			chunk_f(&fs);
+			chunk_f(fs);
 			end = time_nsec();
 			dedup_stats.serial_ns += end - start;
 			printf("Finished serial hashing! Onto phase 2\n");
 	}
-	chunking_phase_two(&fs);
+	chunking_phase_two(fs, use_parallel);
 }
 
 #endif
