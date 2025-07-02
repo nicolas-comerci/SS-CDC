@@ -417,13 +417,13 @@ static inline bool is_breakpoint(const uint8_t* cutpoint_bitmap, uint64_t idx){
 }
 
 
-static void next_chunk_parallel(sscdc_args& args, file_struct& fs, uint64_t& current_chunk_size, const uint8_t* cutpoint_bitmask) {
+static void next_chunk_parallel(sscdc_args& args, file_struct& fs, uint64_t& current_chunk_size, const uint8_t* cutpoint_bitmap) {
 	__m512i vindex = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-	__m512i zero_v = _mm512_set1_epi32(32);
+	__m512i zero_v = _mm512_set1_epi32(0);
 	for (current_chunk_size = args.min_chunksize; current_chunk_size < args.max_chunksize && fs.next_start + current_chunk_size < fs.length; ) {
 		uint64_t offset = (fs.next_start + current_chunk_size) % 8;
 		if (offset > 0) {
-			uint8_t b = cutpoint_bitmask[(fs.next_start + current_chunk_size) / 8];
+			uint8_t b = cutpoint_bitmap[(fs.next_start + current_chunk_size) / 8];
 			b = b >> offset;
 			if (b) {
 				while ((b & 0x1) == 0) {
@@ -437,9 +437,8 @@ static void next_chunk_parallel(sscdc_args& args, file_struct& fs, uint64_t& cur
 			else
 				current_chunk_size += 8 - offset;
 		}
-		__m512i bm = _mm512_i32gather_epi32(vindex, &cutpoint_bitmask[(fs.next_start + current_chunk_size) / 8], 4);
-		__m512i bit = _mm512_lzcnt_epi32(bm);
-		__mmask16 lane_has_result_bitmask = _mm512_cmpneq_epi32_mask(bit, zero_v);
+		__m512i bm = _mm512_i32gather_epi32(vindex, &cutpoint_bitmap[(fs.next_start + current_chunk_size) / 8], 4);
+		__mmask16 lane_has_result_bitmask = _mm512_cmpneq_epi32_mask(bm, zero_v);
 		if (lane_has_result_bitmask == 0) {
 			current_chunk_size += 512ull;
 			//printf("lane_has_result_bitmask: %x bit[0] %x idx %lu\n", lane_has_result_bitmask, vector_idx(bm, 0), fs.next_start + current_chunk_size);
@@ -469,15 +468,67 @@ static void next_chunk_parallel(sscdc_args& args, file_struct& fs, uint64_t& cur
 	}
 }
 
+static void next_chunk_serial(sscdc_args& args, file_struct& fs, uint64_t& current_chunk_size, const uint8_t* cutpoint_bitmap) {
+	// You might argue this implementation is not truly serial as we essentially use 64bit unsigned ints as vectors.
+	// To that I say: I don't care. It still uses no SIMD instructions and is much faster, so I think a comparison to an
+	// artificially serialized algorithm that would never be used by anyone has no value, because an implementation like this
+	// is what would be used if SIMD is not available.
 
-static bool next_chunk(sscdc_args& args, file_struct& fs, chunk_boundary& cb, bool use_parallel, const uint8_t* cutpoint_bitmask = nullptr){
+	current_chunk_size = args.min_chunksize;
+	const uint64_t chunk_size_limit = fs.length >= fs.next_start + args.max_chunksize ? args.max_chunksize : fs.length - fs.next_start;
+	// First align ourselves so the current chunk offset is at the start of a byte on the bitmask
+	const uint8_t disaligned_bits = (fs.next_start + current_chunk_size) % 8;
+	const uint8_t bits_to_alignment = disaligned_bits == 0 ? 0 : 8 - disaligned_bits;
+	const uint64_t chunk_size_limit_realigned = std::min(current_chunk_size + bits_to_alignment, chunk_size_limit);
+	while (current_chunk_size < chunk_size_limit_realigned) {
+		if (is_breakpoint(cutpoint_bitmap, fs.next_start + current_chunk_size)) {
+			//printf("idx: %lu\n", fs.next_start + current_chunk_size);
+			break;
+		}
+		current_chunk_size++;
+	}
+
+	// Now that we are aligned on the bitmask we figure out how many 64bit "vectors" we can fit inside and use them to advance 64bits at a time,
+	// at least until an actual cutpoint is found
+	const uint64_t chunk_size_limit_multiple64 = current_chunk_size + (((chunk_size_limit - current_chunk_size) / 64u) * 64u);
+	while (current_chunk_size < chunk_size_limit_multiple64) {
+		uint64_t bits = *reinterpret_cast<const uint64_t*>(&cutpoint_bitmap[(fs.next_start + current_chunk_size) / 8]);
+		if (bits == 0) {
+			current_chunk_size += 64;
+			continue;
+		}
+		uint8_t bit = 0;
+		for (; bit < 64; bit++) {
+			if (is_breakpoint(cutpoint_bitmap, fs.next_start + current_chunk_size + bit)) {
+				//printf("idx: %lu\n", fs.next_start + current_chunk_size);
+				break;
+			}
+		}
+		current_chunk_size += bit;
+		break;
+	}
+
+	// If we still didn't find a cutpoint we attempt on any leftover bits that didn't fit into a 64bit vector.
+	// If we don't find a cutpoint here, we will end up cutting using the max_chunksize.
+	if (current_chunk_size == chunk_size_limit_multiple64) {
+		while (current_chunk_size < chunk_size_limit) {
+			if (is_breakpoint(cutpoint_bitmap, fs.next_start + current_chunk_size)) {
+				//printf("idx: %lu\n", fs.next_start + current_chunk_size);
+				break;
+			}
+			current_chunk_size++;
+		}
+	}
+}
+
+
+static bool next_chunk(sscdc_args& args, file_struct& fs, chunk_boundary& cb, bool use_parallel, const uint8_t* cutpoint_bitmap = nullptr){
 	uint64_t current_chunk_size = 0;
-	if (!cutpoint_bitmask) cutpoint_bitmask = use_parallel ? fs.breakpoint_bm_parallel : fs.breakpoint_bm_serial;
+	if (!cutpoint_bitmap) cutpoint_bitmap = use_parallel ? fs.breakpoint_bm_parallel : fs.breakpoint_bm_serial;
 
-	assert(cb);
 	if (reach_end(fs))
 		return false;
-	if (bytes_left(fs) < 2ull * args.min_chunksize) {
+	if (bytes_left(fs) < 2ull * args.min_chunksize) {  // TODO: check... why multiply by 2 here? is this correct?
 		cb.left = fs.next_start;
 		cb.right = fs.length;
 		fs.next_start = cb.right;
@@ -492,16 +543,10 @@ static bool next_chunk(sscdc_args& args, file_struct& fs, chunk_boundary& cb, bo
 	}
 
 	if (use_parallel) {
-		next_chunk_parallel(args, fs, current_chunk_size, cutpoint_bitmask);
+		next_chunk_parallel(args, fs, current_chunk_size, cutpoint_bitmap);
 	}
 	else {
-		for (current_chunk_size = args.min_chunksize; current_chunk_size < args.max_chunksize && fs.next_start + current_chunk_size < fs.length; ) {
-			if (is_breakpoint(cutpoint_bitmask, fs.next_start + current_chunk_size)) {
-				//printf("idx: %lu\n", fs.next_start + current_chunk_size);
-				break;
-			}
-			current_chunk_size++;
-		}
+		next_chunk_serial(args, fs, current_chunk_size, cutpoint_bitmap);
 	}
 
 	cb.left = fs.next_start;
@@ -600,7 +645,7 @@ static void chunking_phase_two(sscdc_args& args, file_struct& fs, bool use_paral
 
 	fs.next_start = 0;
 
-	while(next_chunk(args, fs, cb, use_parallel)) {
+	while(next_chunk(args, fs, cb, false, fs.breakpoint_bm_serial)) {
 		s_time = time_nsec();
 		hash = XXH3_64bits(static_cast<uint8_t*>(fs.map) + cb.left, cb.right - cb.left);
 		dedup_stats.dedup_ns += time_nsec() - s_time;
