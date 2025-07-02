@@ -26,8 +26,8 @@ static inline void doCrc_serial_crc(uint32_t c, uint32_t* x) {
 }
 
 
-void chunking_phase_one_serial_crc(file_struct& fs){
-	if(fs.length <= HASHLEN || fs.length<= min_chunksize) {
+void chunking_phase_one_serial_crc(sscdc_args& args, file_struct& fs){
+	if(fs.length <= HASHLEN || fs.length<= args.min_chunksize) {
 		//printf("Serial: For file with %lu bytes, no chunking\n", fs.length);
 		// set remaining bitmap to 0000...1
 		return;
@@ -38,7 +38,7 @@ void chunking_phase_one_serial_crc(file_struct& fs){
 	uint32_t hash = 0;
 	uint8_t *str = static_cast<uint8_t*>(fs.map);
 
-	if (!skip_mini){
+	if (!args.skip_mini){
 		while( offset < fs.test_length ){
 			if(offset < HASHLEN){
 				doCrc_serial_crc(str[offset], &hash);	
@@ -48,7 +48,7 @@ void chunking_phase_one_serial_crc(file_struct& fs){
 
 			hash^=crcu[str[offset-HASHLEN]];
 			doCrc_serial_crc(str[offset], &hash);
-			if((hash & break_mask) == magic_number){
+			if((hash & args.break_mask) == args.magic_number){
 				uint8_t b = fs.breakpoint_bm_serial[offset/8];
 				b |= 1<<offset%8;
 				fs.breakpoint_bm_serial[offset/8] = b;
@@ -69,13 +69,13 @@ void chunking_phase_one_serial_crc(file_struct& fs){
 
 			hash^=crcu[str[offset-HASHLEN]];
 			doCrc_serial_crc(str[offset], &hash);
-			if(offset-last_offset >= min_chunksize && (hash & break_mask) == magic_number){
+			if(offset-last_offset >= args.min_chunksize && (hash & args.break_mask) == args.magic_number){
 				uint8_t b = fs.breakpoint_bm_serial[offset/8];
 				b |= 1<<offset%8;
 				fs.breakpoint_bm_serial[offset/8] = b;
 				//printf("hash %x offset %d left %x right %x\n", hash, offset, str[offset-HASHLEN], str[offset]);
 				last_offset = offset;
-				offset+=min_chunksize-HASHLEN;
+				offset+=args.min_chunksize-HASHLEN;
 				local_offset = 0;
 			}else
 				offset+=1;
@@ -84,9 +84,9 @@ void chunking_phase_one_serial_crc(file_struct& fs){
 }
 
 
-void chunking_phase_one_parallel_crc(file_struct& fs){
+void chunking_phase_one_parallel_crc(sscdc_args& args, file_struct& fs){
 	__m512i vindex = _mm512_setr_epi32(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
-	__m512i mm_break_mark = _mm512_set1_epi32(break_mask);
+	__m512i mm_break_mark = _mm512_set1_epi32(args.break_mask);
 	__m512i cmask = _mm512_set1_epi32(0xff);
 	__m512i mm_zero = _mm512_set1_epi32(0);
 	uint64_t n_bytes_left;
@@ -106,22 +106,22 @@ void chunking_phase_one_parallel_crc(file_struct& fs){
 	uint64_t i = 0;
 	__m512i hash = mm_zero;
 	while (n_bytes_left > 0){
-		if (n_bytes_left >= n_threads*segment_size){
-			cur_segsize = last_segsize = segment_size;
-			n_bytes_left -= n_threads*segment_size;
+		if (n_bytes_left >= N_LANES*args.segment_size){
+			cur_segsize = last_segsize = args.segment_size;
+			n_bytes_left -= N_LANES*args.segment_size;
 		}else{
-			if (n_bytes_left <= n_threads * HASHLEN || n_bytes_left <= min_chunksize){
-				printf("Parallel: For file with %lu bytes, no chunking with min=%u max=%u\n", n_bytes_left, n_threads*HASHLEN, min_chunksize);
+			if (n_bytes_left <= N_LANES * HASHLEN || n_bytes_left <= args.min_chunksize){
+				printf(std::format("Parallel: For file with {} bytes, no chunking with min={} max={}\n", n_bytes_left, N_LANES*HASHLEN, args.min_chunksize).c_str());
 				// set remaining bitmap to 0000...1
 				return;
 			}
 
-			cur_segsize = n_bytes_left/n_threads/32*32;
-			last_segsize = n_bytes_left-cur_segsize*(n_threads-1);
+			cur_segsize = n_bytes_left/N_LANES/32*32;
+			last_segsize = n_bytes_left-cur_segsize*(N_LANES-1);
 			n_bytes_left = 0;
 		}
 
-		//printf("Processing data stream at [0X%x-0X%x-1]: 0x%x bytes/thread parallel\n", offset, offset+cur_segsize*n_threads, cur_segsize);
+		//printf("Processing data stream at [0X%x-0X%x-1]: 0x%x bytes/thread parallel\n", offset, offset+cur_segsize*N_LANES, cur_segsize);
 		// For the first HASHLEN bytes, calculate hash value
 		for (; i<HASHLEN; i+=4){
 			__m512i cbytes = _mm512_i32gather_epi32(vindex, (void*)((uint8_t*)fs.map+offset+i), 1);
@@ -155,7 +155,7 @@ void chunking_phase_one_parallel_crc(file_struct& fs){
 
 					__m512i ret = _mm512_and_epi32(hash, mm_break_mark);
 
-					__mmask16 bits = _mm512_cmpeq_epi32_mask(ret,_mm512_set1_epi32(magic_number));
+					__mmask16 bits = _mm512_cmpeq_epi32_mask(ret,_mm512_set1_epi32(args.magic_number));
 					if(bits > 0) {
 						//ret = _mm512_maskz_abs_epi32(bits,_mm512_set1_epi32(1));
 						ret = _mm512_maskz_set1_epi32(bits,1);
@@ -182,12 +182,12 @@ void chunking_phase_one_parallel_crc(file_struct& fs){
 		if(cur_segsize < last_segsize){
 			uint8_t *str = (uint8_t*)fs.map+bytes_per_thread*15;
 			uint32_t hash2 = vector_idx(hash, 15);
-			//printf("Processing data stream at [0x%x-0x%lx]: sequential\n", offset+cur_segsize*n_threads, fs.test_length-1);
+			//printf("Processing data stream at [0x%x-0x%lx]: sequential\n", offset+cur_segsize*N_LANES, fs.test_length-1);
 			//sequential process of the remaining bytes
 			while(i < last_segsize){
 				hash2^=crcu[str[i-HASHLEN]];
 				doCrc_serial_crc(str[i], &hash2);
-				if((hash2 & break_mask) == magic_number ){
+				if((hash2 & args.break_mask) == args.magic_number ){
 					uint8_t b = fs.breakpoint_bm_parallel[(i+bytes_per_thread*15)/8];
 					b |= 1<<(i+bytes_per_thread*15)%8;
 					fs.breakpoint_bm_parallel[(i+bytes_per_thread*15)/8] = b;
@@ -198,7 +198,7 @@ void chunking_phase_one_parallel_crc(file_struct& fs){
 			n_bytes_left = 0;
 		}
 		
-		//offset += cur_segsize*n_threads;
+		//offset += cur_segsize*N_LANES;
 		offset += cur_segsize;
 	}
 
