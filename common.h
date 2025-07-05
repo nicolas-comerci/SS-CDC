@@ -417,7 +417,7 @@ static inline bool is_breakpoint(const uint8_t* cutpoint_bitmap, uint64_t idx){
 }
 
 
-static void next_chunk_parallel(sscdc_args& args, file_struct& fs, uint64_t& current_chunk_size, const uint8_t* cutpoint_bitmap) {
+static void next_chunk_parallel_v0(sscdc_args& args, file_struct& fs, uint64_t& current_chunk_size, const uint8_t* cutpoint_bitmap) {
 	__m512i vindex = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
 	__m512i zero_v = _mm512_set1_epi32(0);
 	for (current_chunk_size = args.min_chunksize; current_chunk_size < args.max_chunksize && fs.next_start + current_chunk_size < fs.length; ) {
@@ -465,6 +465,60 @@ static void next_chunk_parallel(sscdc_args& args, file_struct& fs, uint64_t& cur
 		//printf("lane_bitmap %x idx: %lu\n", lane_bitmap, fs.next_start + current_chunk_size);
 		//printf("idx: %lu\n", fs.next_start + current_chunk_size);
 		break;
+	}
+}
+
+static void next_chunk_parallel_v1(sscdc_args& args, file_struct& fs, uint64_t& current_chunk_size, const uint8_t* cutpoint_bitmap) {
+	__m512i zero_v = _mm512_set1_epi64(0);
+	current_chunk_size = args.min_chunksize;
+	const uint64_t chunk_size_limit = fs.length >= fs.next_start + args.max_chunksize ? args.max_chunksize : fs.length - fs.next_start;
+	// First align ourselves so the current chunk offset is at the start of a byte on the bitmask
+	const uint8_t disaligned_bits = (fs.next_start + current_chunk_size) % 8;
+	const uint8_t bits_to_alignment = disaligned_bits == 0 ? 0 : 8 - disaligned_bits;
+	const uint64_t chunk_size_limit_realigned = std::min(current_chunk_size + bits_to_alignment, chunk_size_limit);
+	while (current_chunk_size < chunk_size_limit_realigned) {
+		if (is_breakpoint(cutpoint_bitmap, fs.next_start + current_chunk_size)) {
+			//printf("idx: %lu\n", fs.next_start + current_chunk_size);
+			break;
+		}
+		current_chunk_size++;
+	}
+
+	// Now that we are aligned on the bitmask we figure out how many 512bit vectors we can fit inside and use them to advance 512bits at a time,
+	// at least until an actual cutpoint is found
+	const uint64_t chunk_size_limit_multiple512 = current_chunk_size + (((chunk_size_limit - current_chunk_size) / 512u) * 512u);
+	while (current_chunk_size < chunk_size_limit_multiple512) {
+		__m512i bits = _mm512_loadu_si512(&cutpoint_bitmap[(fs.next_start + current_chunk_size) / 8]);
+		__mmask8 lane_has_result_bitmask = _mm512_cmpneq_epi64_mask(bits, zero_v);
+		if (lane_has_result_bitmask == 0) {
+			current_chunk_size += 512ull;
+			continue;
+		}
+		uint8_t lane_i = 0;
+		while (((lane_has_result_bitmask >> lane_i) & 0x1) == 0) {
+			lane_i++;
+		}
+		uint8_t bit = 0;
+		for (; bit < 64; bit++) {
+			if (is_breakpoint(cutpoint_bitmap, fs.next_start + current_chunk_size + lane_i * 64ull + bit)) {
+				//printf("idx: %lu\n", fs.next_start + current_chunk_size);
+				break;
+			}
+		}
+		current_chunk_size += lane_i * 64ull + bit;
+		break;
+	}
+
+	// If we still didn't find a cutpoint we attempt on any leftover bits that didn't fit into a 512bit vector.
+	// If we don't find a cutpoint here, we will end up cutting using the max_chunksize.
+	if (current_chunk_size == chunk_size_limit_multiple512) {
+		while (current_chunk_size < chunk_size_limit) {
+			if (is_breakpoint(cutpoint_bitmap, fs.next_start + current_chunk_size)) {
+				//printf("idx: %lu\n", fs.next_start + current_chunk_size);
+				break;
+			}
+			current_chunk_size++;
+		}
 	}
 }
 
@@ -543,7 +597,8 @@ static bool next_chunk(sscdc_args& args, file_struct& fs, chunk_boundary& cb, bo
 	}
 
 	if (use_parallel) {
-		next_chunk_parallel(args, fs, current_chunk_size, cutpoint_bitmap);
+		//next_chunk_parallel_v0(args, fs, current_chunk_size, cutpoint_bitmap);
+		next_chunk_parallel_v1(args, fs, current_chunk_size, cutpoint_bitmap);
 	}
 	else {
 		next_chunk_serial(args, fs, current_chunk_size, cutpoint_bitmap);
@@ -645,7 +700,7 @@ static void chunking_phase_two(sscdc_args& args, file_struct& fs, bool use_paral
 
 	fs.next_start = 0;
 
-	while(next_chunk(args, fs, cb, false, fs.breakpoint_bm_serial)) {
+	while(next_chunk(args, fs, cb, use_parallel)) {
 		s_time = time_nsec();
 		hash = XXH3_64bits(static_cast<uint8_t*>(fs.map) + cb.left, cb.right - cb.left);
 		dedup_stats.dedup_ns += time_nsec() - s_time;
