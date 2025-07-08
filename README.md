@@ -1,3 +1,21 @@
+# Fork description
+
+This is a fork of https://github.com/NetApp/SS-CDC I did while I was studying the SS-CDC algorithm for my own research.
+
+While I was reading and gaining understanding and toying with it, I made some changes for easier compilation and clarity of code, and even fixed some bugs.
+
+- I removed the OpenSSL dependency and replaced it with bundled xxHash https://github.com/Cyan4973/xxHash?tab=License-1-ov-file#readme
+- Changed some code to make it crossplatform
+- Used C++ features to remove cumbersome C code (for example there was a custom fingerprint pool I just replaced with an std::unordered_set)
+- Implemented faster versions of both the serial and parallel chunks cutting phase
+- Some more stuff
+
+In general for anyone trying to check out the algo and toy around with the code, this version should be significantly more friendly.
+
+As for me, I am done with it at this point.
+
+# NetApp's Original ReadMe
+
 This repository’s contents is being provided by NetApp, Inc. for non-commercial research purposes only. Review the LICENSE for more details.
 
 **DESCRIPTION:**  

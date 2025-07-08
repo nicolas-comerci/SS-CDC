@@ -252,7 +252,7 @@ struct sscdc_args {
 	std::string hash_name{};
 	uint32_t min_chunksize = 2 * 1024;
 	uint32_t max_chunksize = 64 * 1024;
-	uint64_t segment_size = 1 * 1024 * 1024;
+	uint64_t segment_size = 1ull * 1024 * 1024;
 	uint32_t magic_number = 0;
 	uint32_t break_mask_bit = 14;
 	uint32_t break_mask = (1u << break_mask_bit) - 1;
